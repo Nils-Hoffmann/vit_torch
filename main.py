@@ -9,10 +9,13 @@ import torch
 import torch.profiler
 from torch.optim import Adam
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
-def main():
+def main(rank: int = 1, world_size: int = 1):
     use_v2_dataloader = False
-    enable_profiling = True
+    enable_profiling = False
     run_eval = False
     use_data_iter_prefetch = False
 
@@ -26,6 +29,9 @@ def main():
     eval_profile_active = 3
     eval_profile_repeat = 1
 
+    train_batch_size = 256
+    eval_batch_size = 256
+
 
     copy_stream = torch.cuda.Stream()
 
@@ -34,10 +40,19 @@ def main():
     print(f"Using matmul precision: {torch.get_float32_matmul_precision()}")
 
     config = ModelConfig()
-    device = "cuda"
-    model = ViT(config).to(device)
-    model_compiled = torch.compile(model)
-    optimizer = Adam(model.parameters(), lr=3e-4)
+    device = f"cuda:{rank}"
+
+    if world_size == 1:
+        model = ViT(config).to(device)
+        model_compiled = torch.compile(model)
+        optimizer = Adam(model.parameters(), lr=3e-4)
+    else:
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        model = ViT(config).to(device)
+        model = DistributedDataParallel(model, device_ids=[rank])
+        model_compiled = torch.compile(model)
+        optimizer = Adam(model.parameters(), lr=3e-4)
+
 
     def train_step(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
@@ -68,8 +83,6 @@ def main():
         acc = (logits.argmax(-1) == y).float().mean()
         return loss, acc
     
-    train_batch_size = 128
-    eval_batch_size = 128
 
     if use_v2_dataloader:
         pipeline = dataloaderv2.build_cifar10_pipeline(
@@ -78,6 +91,8 @@ def main():
             use_bf16=True,
             num_workers=4,
             to_torch=True,
+            rank=rank,
+            world_size=world_size,
         )
         eval_pipeline = dataloaderv2.build_cifar10_pipeline(
             batch_size=eval_batch_size,
@@ -88,12 +103,16 @@ def main():
             num_workers=4,
             to_torch=True,
             infinite=False,
+            rank=rank,
+            world_size=world_size,
         )
     else:
         pipeline = data.build_cifar10_pipeline(
             batch_size=train_batch_size,
             augment=True,
             to_torch=True,
+            rank=rank,
+            world_size=world_size,
         )
         eval_pipeline = data.build_cifar10_pipeline(
             batch_size=eval_batch_size,
@@ -102,6 +121,8 @@ def main():
             augment=False,
             to_torch=True,
             infinite=False,
+            rank=rank,
+            world_size=world_size,
         )
 
     steps_per_epoch = pipeline.steps_per_epoch
@@ -192,8 +213,8 @@ def main():
         profiler_context = contextlib.nullcontext()
 
     next_x, next_y = next(data_iter)
-    device_next_x, device_next_y = torch.empty_like(next_x, device="cuda"), torch.empty_like(next_y, device="cuda")
-    device_x, device_y = torch.empty_like(next_x, device="cuda"), torch.empty_like(next_y, device="cuda")
+    device_next_x, device_next_y = torch.empty_like(next_x, device=device), torch.empty_like(next_y, device=device)
+    device_x, device_y = torch.empty_like(next_x, device=device), torch.empty_like(next_y, device=device)
 
     with profiler_context as prof:
         if not next_y.is_pinned():
@@ -230,7 +251,7 @@ def main():
             prof.step()
 
         filename = f"./profiles/vit-main-{datetime.datetime.now().isoformat()}"
-        print(f"profiling part complete, writing to ${filename}")
+        print(f"profiling part complete, writing to {filename}")
         prof.export_chrome_trace(filename)
 
     next_x, next_y = next(data_iter)
@@ -245,7 +266,6 @@ def main():
 
     logging_start = time.time()
     for step in range(100, total_steps):
-
 
         # wait for copy stream (async memocpy, establish wait relationship)
         torch.cuda.current_stream().wait_stream(copy_stream)
@@ -273,19 +293,34 @@ def main():
         if (step + 1) % log_interval == 0:
             time_taken = time.time() - logging_start
             # Sync once per log interval instead of every step.
-            avg_loss = (running_loss / running_steps).item()
-            avg_acc = (running_acc / running_steps).item()
-            avg_time = time_taken / log_interval
-            throughput = running_samples / time_taken
+            if world_size == 1:
+                avg_loss = (running_loss / running_steps).item()
+                avg_acc = (running_acc / running_steps).item()
+                avg_time = time_taken / log_interval
+                throughput = running_samples / time_taken
+            else:
+                running_samples_t = torch.tensor(running_samples, device=device)
+                dist.all_reduce(running_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(running_acc, op=dist.ReduceOp.SUM)
+                dist.all_reduce(running_samples_t, op=dist.ReduceOp.SUM)
+                avg_loss = (running_loss / running_steps).item() / world_size
+                avg_acc = (running_acc / running_steps).item() / world_size
+
+                # use rank 0 time instead of reducing, this is a sync barrier anyway.
+                avg_time = time_taken / log_interval
+                throughput = running_samples_t.item() / time_taken
 
             current_epoch = (step + 1 + steps_per_epoch - 1) // steps_per_epoch
             step_in_epoch = (step % steps_per_epoch) + 1
-            print(
-                f"Step {step + 1} (Epoch {current_epoch}/{num_epochs}, "
-                f"Step {step_in_epoch}/{steps_per_epoch})"
-            )
-            print(f"avg loss: {avg_loss} | avg accuracy: {avg_acc}")
-            print(f"avg time/step: {avg_time} | throughput: {throughput:.2f} samples/s")
+
+            if rank == 0:
+                print(
+                    f"Step {step + 1} (Epoch {current_epoch}/{num_epochs}, "
+                    f"Step {step_in_epoch}/{steps_per_epoch})"
+                )
+                print(f"avg loss: {avg_loss} | avg accuracy: {avg_acc}")
+                print(f"avg time/step: {avg_time} | throughput: {throughput:.2f} samples/s")
+                
             logging_start = time.time()
             running_loss.zero_()
             running_acc.zero_()
@@ -315,4 +350,12 @@ def main():
 
 
 if __name__ == "__main__":
+    world_size = 2
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
+    mp.spawn(main,
+        args=(world_size,),
+        nprocs=world_size,
+        join=True)
+
     main()

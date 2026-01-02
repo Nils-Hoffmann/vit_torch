@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Iterator, Sequence
 import datasets
+from datasets.distributed import split_dataset_by_node
 import numpy as np
 from PIL import Image
 import threading
@@ -323,6 +324,8 @@ def build_cifar10_pipeline(
     output_size=(224, 224),
     to_torch: bool = True,
     infinite: bool = True,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataPipeline:
     """Construct a CIFAR-10 training pipeline yielding batched (image, label) pairs.
 
@@ -339,8 +342,9 @@ def build_cifar10_pipeline(
     cache_path = cache_dir or os.path.join(os.getcwd(), ".hf_cache")
     os.makedirs(cache_path, exist_ok=True)
 
-    # CIFAR-10 dataset sizes
-    num_examples = 50_000 if split == "train" else 10_000
+    # CIFAR-10 dataset sizes (per-worker count for DDP)
+    total_examples = 50_000 if split == "train" else 10_000
+    num_examples = total_examples // world_size
 
     if streaming:
         dataset_dict = datasets.load_dataset("cifar10", streaming=True, cache_dir=cache_path)
@@ -348,12 +352,18 @@ def build_cifar10_pipeline(
         if shuffle:
             shuffle_seed = 0 if seed is None else seed
             iterable = iterable.shuffle(buffer_size=10_000, seed=shuffle_seed)
+        # Shard dataset for distributed training
+        if world_size > 1:
+            iterable = split_dataset_by_node(iterable, rank=rank, world_size=world_size)
     else:
         dataset = datasets.load_dataset("cifar10", split=split, cache_dir=cache_path)
         if shuffle:
             shuffle_seed = 0 if seed is None else seed
             dataset = dataset.shuffle(seed=shuffle_seed)
         iterable = dataset.to_iterable_dataset()
+        # Shard dataset for distributed training
+        if world_size > 1:
+            iterable = split_dataset_by_node(iterable, rank=rank, world_size=world_size)
 
     pipeline = DataPipeline(
         iterable,
