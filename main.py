@@ -332,19 +332,31 @@ def main(rank: int = 1, world_size: int = 1):
 
     time_taken = time.time() - logging_start
     # Sync once per log interval instead of every step.
-    avg_loss = (running_loss / running_steps).item()
-    avg_acc = (running_acc / running_steps).item()
-    avg_time = time_taken / log_interval
-    throughput = running_samples / time_taken
+    if world_size == 1:
+        avg_loss = (running_loss / running_steps).item()
+        avg_acc = (running_acc / running_steps).item()
+        avg_time = time_taken / log_interval
+        throughput = running_samples / time_taken
+    else:
+        running_samples_t = torch.tensor(running_samples, device=device)
+        dist.all_reduce(running_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(running_acc, op=dist.ReduceOp.SUM)
+        dist.all_reduce(running_samples_t, op=dist.ReduceOp.SUM)
+        avg_loss = (running_loss / running_steps).item() / world_size
+        avg_acc = (running_acc / running_steps).item() / world_size
+        avg_time = time_taken / log_interval
+        throughput = running_samples_t.item() / time_taken
 
     current_epoch = (total_steps + 1 + steps_per_epoch - 1) // steps_per_epoch
     step_in_epoch = (total_steps % steps_per_epoch) + 1
-    print(
-        f"Step {total_steps + 1} (Epoch {current_epoch}/{num_epochs}, "
-        f"Step {step_in_epoch}/{steps_per_epoch})"
-    )
-    print(f"avg loss: {avg_loss} | avg accuracy: {avg_acc}")
-    print(f"avg time/step: {avg_time} | throughput: {throughput:.2f} samples/s")
+
+    if rank == 0:
+        print(
+            f"Step {total_steps + 1} (Epoch {current_epoch}/{num_epochs}, "
+            f"Step {step_in_epoch}/{steps_per_epoch})"
+        )
+        print(f"avg loss: {avg_loss} | avg accuracy: {avg_acc}")
+        print(f"avg time/step: {avg_time} | throughput: {throughput:.2f} samples/s")
 
 
 
