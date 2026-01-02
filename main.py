@@ -32,6 +32,9 @@ def main(rank: int = 1, world_size: int = 1):
     train_batch_size = 256
     eval_batch_size = 256
 
+    # Training configuration
+    num_epochs = 10
+    log_interval = 50  # Log stats every N steps
 
     copy_stream = torch.cuda.Stream()
 
@@ -127,9 +130,6 @@ def main(rank: int = 1, world_size: int = 1):
 
     steps_per_epoch = pipeline.steps_per_epoch
 
-    # Training configuration
-    num_epochs = 1
-    log_interval = 50  # Log stats every N steps
 
     assert steps_per_epoch is not None, "Could not determine steps_per_epoch from pipeline"
     total_steps = num_epochs * steps_per_epoch
@@ -192,7 +192,10 @@ def main(rank: int = 1, world_size: int = 1):
     data_iter = iter(pipeline.prefetch(buffer_size=2) if use_data_iter_prefetch else pipeline)
     sample_counts: list[int] = []
 
-    profiler_context: contextlib.AbstractContextManager
+    next_x, next_y = next(data_iter)
+    device_next_x, device_next_y = torch.empty_like(next_x, device=device), torch.empty_like(next_y, device=device)
+    device_x, device_y = torch.empty_like(next_x, device=device), torch.empty_like(next_y, device=device)
+
     if enable_profiling:
         profiler_context = torch.profiler.profile(
             activities=[
@@ -209,35 +212,9 @@ def main(rank: int = 1, world_size: int = 1):
             profile_memory=True,
             with_flops=True,
         )
-    else:
-        profiler_context = contextlib.nullcontext()
 
-    next_x, next_y = next(data_iter)
-    device_next_x, device_next_y = torch.empty_like(next_x, device=device), torch.empty_like(next_y, device=device)
-    device_x, device_y = torch.empty_like(next_x, device=device), torch.empty_like(next_y, device=device)
 
-    with profiler_context as prof:
-        if not next_y.is_pinned():
-            next_y = next_y.pin_memory()
-        if not next_x.is_pinned():
-            next_x = next_x.pin_memory()
-
-        with torch.cuda.stream(copy_stream):
-            device_next_x.copy_(next_x, non_blocking=True)
-            device_next_y.copy_(next_y, non_blocking=True)
-
-        for step in range(20):
-
-            # wait for copy stream (async memocpy, establish wait relationship)
-            torch.cuda.current_stream().wait_stream(copy_stream)
-            device_x, device_y = device_next_x, device_next_y
-            # establish ownership relationship for GC
-            device_x.record_stream(torch.cuda.current_stream())
-            device_y.record_stream(torch.cuda.current_stream())
-
-            loss, acc = train_step(device_x, device_y)
-            
-            next_x, next_y = next(data_iter)
+        with profiler_context as prof:
             if not next_y.is_pinned():
                 next_y = next_y.pin_memory()
             if not next_x.is_pinned():
@@ -247,12 +224,36 @@ def main(rank: int = 1, world_size: int = 1):
                 device_next_x.copy_(next_x, non_blocking=True)
                 device_next_y.copy_(next_y, non_blocking=True)
 
-            sample_counts.append(device_x.shape[0])
-            prof.step()
+            for step in range(20):
 
-        filename = f"./profiles/vit-main-{datetime.datetime.now().isoformat()}"
-        print(f"profiling part complete, writing to {filename}")
-        prof.export_chrome_trace(filename)
+                # wait for copy stream (async memocpy, establish wait relationship)
+                torch.cuda.current_stream().wait_stream(copy_stream)
+                device_x, device_y = device_next_x, device_next_y
+                # establish ownership relationship for GC
+                device_x.record_stream(torch.cuda.current_stream())
+                device_y.record_stream(torch.cuda.current_stream())
+
+                loss, acc = train_step(device_x, device_y)
+                
+                next_x, next_y = next(data_iter)
+                if not next_y.is_pinned():
+                    next_y = next_y.pin_memory()
+                if not next_x.is_pinned():
+                    next_x = next_x.pin_memory()
+
+                with torch.cuda.stream(copy_stream):
+                    device_next_x.copy_(next_x, non_blocking=True)
+                    device_next_y.copy_(next_y, non_blocking=True)
+
+                sample_counts.append(device_x.shape[0])
+                prof.step()
+
+            filename = f"./profiles/vit-main-rank-{rank}-{datetime.datetime.now().isoformat()}"
+            print(f"profiling part complete, writing to {filename}")
+            prof.export_chrome_trace(filename)
+        training_loop_start_step = 100
+    else:
+        training_loop_start_step = 0
 
     next_x, next_y = next(data_iter)
     if not next_y.is_pinned():
@@ -265,7 +266,7 @@ def main(rank: int = 1, world_size: int = 1):
         device_next_y.copy_(next_y, non_blocking=True)
 
     logging_start = time.time()
-    for step in range(100, total_steps):
+    for step in range(training_loop_start_step, total_steps):
 
         # wait for copy stream (async memocpy, establish wait relationship)
         torch.cuda.current_stream().wait_stream(copy_stream)
@@ -320,7 +321,7 @@ def main(rank: int = 1, world_size: int = 1):
                 )
                 print(f"avg loss: {avg_loss} | avg accuracy: {avg_acc}")
                 print(f"avg time/step: {avg_time} | throughput: {throughput:.2f} samples/s")
-                
+
             logging_start = time.time()
             running_loss.zero_()
             running_acc.zero_()
