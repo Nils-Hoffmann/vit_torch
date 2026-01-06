@@ -14,7 +14,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 def main(rank: int = 1, world_size: int = 1):
-    use_v2_dataloader = False
+    use_v2_dataloader = True
     enable_profiling = False
     run_eval = False
     use_data_iter_prefetch = False
@@ -359,7 +359,10 @@ def main(rank: int = 1, world_size: int = 1):
         print(f"avg loss: {avg_loss} | avg accuracy: {avg_acc}")
         print(f"avg time/step: {avg_time} | throughput: {throughput:.2f} samples/s")
 
-
+    # Cleanup
+    if world_size > 1:
+        dist.barrier()  # Ensure all ranks finish before cleanup
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -370,5 +373,3 @@ if __name__ == "__main__":
         args=(world_size,),
         nprocs=world_size,
         join=True)
-
-    main()

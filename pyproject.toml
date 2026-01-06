@@ -12,3 +12,7 @@ dependencies = [
     "tensorboard>=2.20.0",
     "torch>=2.9.0",
 ]
+
+[[tool.uv.index]]
+url = "https://pypi-cache.k.fal-dev.deepl.dev/simple"
+default = true
